@@ -1,5 +1,9 @@
-XDR_BASE_URL_CURR=https://github.com/stellar/stellar-xdr/raw/cff714a5ebaaaf2dac343b3546c2df73f0b7a36e
+# CAP-71 + CAP-83 pre-release: pin to the protocol-27 .x and resolve feature
+# gates via `stellar-xdr xfile preprocess` (rs-stellar-xdr #503) before xdrgen,
+# since the Ruby xdrgen used here does not understand #ifdef.
+XDR_BASE_URL_CURR=https://github.com/stellar/stellar-xdr/raw/5187e69f568dc13ccb5ddc74f81ffd4aaba4fea1
 XDR_BASE_LOCAL_CURR=xdr/curr
+XDR_FEATURES=CAP_0071,CAP_0083
 XDR_FILES_CURR= \
 	Stellar-SCP.x \
 	Stellar-ledger-entries.x \
@@ -15,7 +19,7 @@ XDR_FILES_CURR= \
 	Stellar-exporter.x
 XDR_FILES_LOCAL_CURR=$(addprefix xdr/curr/,$(XDR_FILES_CURR))
 
-XDR_BASE_URL_NEXT=https://github.com/stellar/stellar-xdr/raw/cff714a5ebaaaf2dac343b3546c2df73f0b7a36e
+XDR_BASE_URL_NEXT=https://github.com/stellar/stellar-xdr/raw/5187e69f568dc13ccb5ddc74f81ffd4aaba4fea1
 XDR_BASE_LOCAL_NEXT=xdr/next
 XDR_FILES_NEXT= \
 	Stellar-SCP.x \
@@ -42,7 +46,7 @@ generate: src/generated/curr_generated.js types/curr.d.ts src/generated/next_gen
 src/generated/curr_generated.js: $(XDR_FILES_LOCAL_CURR)
 	mkdir -p $(dir $@)
 	> $@
-	docker run -it --rm -v $$PWD:/wd -w /wd ruby:3.1 /bin/bash -c '\
+	docker run --rm -v $$PWD:/wd -w /wd ruby:3.1 /bin/bash -c '\
 		gem install specific_install -v 0.3.8 && \
 		gem specific_install https://github.com/stellar/xdrgen.git -b $(XDRGEN_COMMIT) && \
 		xdrgen --language javascript --namespace curr --output src/generated $^ \
@@ -51,15 +55,15 @@ src/generated/curr_generated.js: $(XDR_FILES_LOCAL_CURR)
 src/generated/next_generated.js: $(XDR_FILES_LOCAL_NEXT)
 	mkdir -p $(dir $@)
 	> $@
-	docker run -it --rm -v $$PWD:/wd -w /wd ruby:3.1 /bin/bash -c '\
+	docker run --rm -v $$PWD:/wd -w /wd ruby:3.1 /bin/bash -c '\
 		gem install specific_install -v 0.3.8 && \
 		gem specific_install https://github.com/stellar/xdrgen.git -b $(XDRGEN_COMMIT) && \
 		xdrgen --language javascript --namespace next --output src/generated $^ \
 		'
 
 types/curr.d.ts: src/generated/curr_generated.js
-	docker run -it --rm -v $$PWD:/wd -w / --entrypoint /bin/sh node:alpine -c '\
-		apk add --update git && \
+	docker run --rm -v $$PWD:/wd -w / --entrypoint /bin/sh node:lts-alpine -c '\
+		apk add --update git && apk add --update yarn && \
 		git clone --depth 1 https://github.com/stellar/dts-xdr -b $(DTSXDR_COMMIT) --single-branch && \
 		cd /dts-xdr && \
 		yarn install --network-concurrency 1 && \
@@ -69,8 +73,8 @@ types/curr.d.ts: src/generated/curr_generated.js
 		'
 
 types/next.d.ts: src/generated/next_generated.js
-	docker run -it --rm -v $$PWD:/wd -w / --entrypoint /bin/sh node:alpine -c '\
-		apk add --update git && \
+	docker run --rm -v $$PWD:/wd -w / --entrypoint /bin/sh node:lts-alpine -c '\
+		apk add --update git && apk add --update yarn && \
 		git clone --depth 1 https://github.com/stellar/dts-xdr -b $(DTSXDR_COMMIT) --single-branch && \
 		cd /dts-xdr && \
 		yarn install --network-concurrency 1 && \
@@ -85,10 +89,12 @@ clean:
 $(XDR_FILES_LOCAL_CURR):
 	mkdir -p $(dir $@)
 	curl -L -o $@ $(XDR_BASE_URL_CURR)/$(notdir $@)
+	stellar-xdr xfile preprocess --features "$(XDR_FEATURES)" $@ > $@.pp && mv -f $@.pp $@
 
 $(XDR_FILES_LOCAL_NEXT):
 	mkdir -p $(dir $@)
 	curl -L -o $@ $(XDR_BASE_URL_NEXT)/$(notdir $@)
+	stellar-xdr xfile preprocess --features "$(XDR_FEATURES)" $@ > $@.pp && mv -f $@.pp $@
 
 reset-xdr:
 	rm -f xdr/*/*.x
@@ -96,3 +102,12 @@ reset-xdr:
 	rm -f types/curr.d.ts
 	rm -f types/next.d.ts
 	$(MAKE) generate
+
+# Post-process: inject `var NAME = VALUE;` declarations for every `xdr.const("NAME", VALUE)`.
+# The xdrgen master branch JS output no longer emits these explicit declarations,
+# but the released @stellar/js-xdr's TypeBuilder.const() does NOT inject into
+# the calling scope — so bare identifiers like `xdr.string(SCSYMBOL_LIMIT)`
+# would fail with ReferenceError at runtime. This restores the released v15.0.0
+# behavior until xdrgen/js-xdr are aligned.
+post-process-generated: src/generated/curr_generated.js src/generated/next_generated.js
+	python3 -c 'import re,pathlib\nfor f in ["src/generated/curr_generated.js","src/generated/next_generated.js"]:\n p=pathlib.Path(f)\n s=p.read_text()\n if "var SCSYMBOL_LIMIT" in s: continue\n consts=re.findall(r"xdr\\.const\\(\"([A-Z0-9_]+)\",\\s*(0x[0-9a-fA-F]+|\\d+)\\);",s)\n decls="\\n".join(f"var {n} = {v};" for n,v in consts)\n s=re.sub(r"(XDR\\.config\\(\\s*(?:xdr\\s*=>|function ?\\(xdr\\))\\s*\\{)",r"\\1\\n"+decls+"\\n",s,count=1)\n p.write_text(s)'
